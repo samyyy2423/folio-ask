@@ -18,7 +18,8 @@ to load with folder
     set config to json from read (folder + "/config.json")
     set heads to item "num_key_value_heads" of config
     set per_head to item "hidden_size" of config / item "num_attention_heads" of config
-    set model to wr_onnx's load(model_file)
+    # its table of token vectors, kept as 8-bit whole numbers, made floats once as it's loaded, not on every token
+    set model to wr_onnx's load_with(model_file, dictionary where "session.disable_quant_qdq" is "1")
     set layers to 0
     for each wanted in wr_onnx's inputs(model)
         if wr_starts(wanted's name, "past_key_values.") and wr_ends(wanted's name, ".key")
@@ -26,7 +27,13 @@ to load with folder
         end
     end
     set stop_ids to list of wr_tokenizer's encode(tok, "<|im_end|>"), wr_tokenizer's encode(tok, "<|endoftext|>")
-    return record with kind "writer", model model, tokenizer tok, layers layers, heads heads, per_head per_head,
+    set keep to list of "logits" # what stays in ONNX Runtime's memory after each step
+    for each made in wr_onnx's outputs(model)
+        if wr_starts(made's name, "present.")
+            add made's name to keep
+        end
+    end
+    return record with kind "writer", model model, tokenizer tok, layers layers, heads heads, per_head per_head, keep keep,
         stops list of item 1 of item 1 of stop_ids, item 1 of item 2 of stop_ids
 end
 
@@ -45,9 +52,10 @@ to generated with w, prompt, most_tokens
     return write_tokens(w, wr_tokenizer's encode(w's tokenizer, chat), most_tokens)
 end
 
-# the model's text after these tokens: the prompt's first token alone, then the rest 64 at a time, each step
-# keeping the layers' keys and values; then the most likely next token, again and again. (With nothing kept yet,
-# Windows' ONNX Runtime 1.17 lets each of several tokens see the ones after it, so the first goes alone.)
+# the model's text after these tokens: the prompt's first token alone, then the rest 64 at a time; then the most
+# likely next token, again and again. Each step's keys and values stay in ONNX Runtime's memory and go back in as
+# they are (onnx.folio's run_keeping), and only the last row of scores is read. (With nothing kept yet, Windows'
+# ONNX Runtime 1.17 lets each of several tokens see the ones after it, so the first goes alone.)
 to write_tokens with w, prompt_ids, most_tokens
     set past to empty dictionary
     for each layer from 0 to w's layers - 1
@@ -55,40 +63,47 @@ to write_tokens with w, prompt_ids, most_tokens
             set item ("past_key_values." + layer + "." + part) of past to wr_arrays's zeros(list of 1, w's heads, 0, w's per_head)
         end
     end
-    set seen to 0
-    set logits to nothing
-    set i to 1
-    repeat while i is at most length of prompt_ids
-        set upto to i + 63
-        if i is 1
-            set upto to 1
-        end
-        if upto is greater than length of prompt_ids
-            set upto to length of prompt_ids
-        end
-        set got to wr_step(w, items i to upto of prompt_ids, seen, past)
-        set past to got's past
-        set logits to got's last
-        set seen to upto
-        set i to upto + 1
-    end
     set made to empty list
-    repeat while length of made is less than most_tokens
-        set next_id to wr_most_likely(logits)
-        if next_id is in w's stops
-            set most_tokens to length of made
-        else
-            add next_id to made
-            set got to wr_step(w, (list of next_id), seen, past)
+    try
+        set seen to 0
+        set logits to nothing
+        set i to 1
+        repeat while i is at most length of prompt_ids
+            set upto to i + 63
+            if i is 1
+                set upto to 1
+            end
+            if upto is greater than length of prompt_ids
+                set upto to length of prompt_ids
+            end
+            set got to wr_step(w, items i to upto of prompt_ids, seen, past)
             set past to got's past
             set logits to got's last
-            add 1 to seen
+            set seen to upto
+            set i to upto + 1
+        end
+        repeat while length of made is less than most_tokens
+            set next_id to wr_most_likely(logits)
+            if next_id is in w's stops
+                set most_tokens to length of made
+            else
+                add next_id to made
+                set got to wr_step(w, (list of next_id), seen, past)
+                set past to got's past
+                set logits to got's last
+                add 1 to seen
+            end
+        end
+    either way
+        for each name in keys of past
+            wr_onnx's release(item name of past)
         end
     end
     return wr_tokenizer's decode(w's tokenizer, made)
 end
 
-# one run of the model: these tokens after `seen` already read; the last one's scores, and the keys and values
+# one run of the model: these tokens after `seen` already read; the last one's scores, and the keys and values,
+# kept in ONNX Runtime's memory. The keys and values given are released once the new ones are made.
 to wr_step with w, ids, seen, past
     set n to length of ids
     set positions to empty list
@@ -104,7 +119,10 @@ to wr_step with w, ids, seen, past
     for each name in keys of past
         set item name of inputs to item name of past
     end
-    set out to wr_onnx's run(w's model, inputs)
+    set out to wr_onnx's run_keeping(w's model, inputs, w's keep)
+    for each name in keys of past
+        wr_onnx's release(item name of past)
+    end
     set kept to empty dictionary
     for each name in keys of out
         if wr_starts(name, "present.")
@@ -112,9 +130,10 @@ to wr_step with w, ids, seen, past
         end
     end
     set scores to item "logits" of out
-    set width to item 3 of scores's shape
-    set numbers to scores's data # the array's own list, not a copy: only the last row is taken from it
-    return record with past kept, last items ((n - 1) * width + 1) to (n * width) of numbers
+    set width to item 3 of wr_onnx's shape_of(scores)
+    set last to wr_onnx's numbers_from(scores, (n - 1) * width + 1, width)
+    wr_onnx's release(scores)
+    return record with past kept, last last
 end
 
 # the place, from 0, of the largest score

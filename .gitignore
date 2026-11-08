@@ -6,5 +6,7 @@ models/
 *.rag
 *.rag.json
 trained/
-# what folio run leaves while a program runs
+# what folio run leaves while a program runs, and what folio build makes
 *-run.exe
+ask.exe
+ask

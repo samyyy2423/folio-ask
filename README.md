@@ -29,7 +29,9 @@ folio run --allow-read --allow-write --allow-libraries ask.folio index docs
 folio run --allow-read --allow-libraries ask.folio ask "How do I install it?"
 ```
 
-`folio get` fetches the packages that `folio.packages` lists, checked against `folio.sums`. `models` fetches the
+It needs a Folio whose onnx.folio has `run_keeping` and `load_with`
+([samyyy2423/folio#46](https://github.com/samyyy2423/folio/pull/46), until it's released). `folio get` fetches the packages that `folio.packages` lists, checked against
+`folio.sums`. `models` fetches the
 three models into `models/` with curl (about 700 MB). `index` reads every file it can under `docs` into
 `docs.rag`. Then:
 
@@ -113,18 +115,28 @@ questions file for your own, in the same form, and run it on them.
 
 ## Speed
 
-On a laptop (Windows 11, x86-64, on its processor):
+On a laptop (Ryzen 5 4600H, Windows 11, on its processor):
 
-- reading 3 files into 69 passages: 3 seconds;
-- an answer in the documents' own sentences (`--quotes`): about 7 seconds, most of it loading the models;
-- reranking 20 passages: under a second;
-- a written answer: 20 to 40 seconds. Loading Qwen takes about 6 seconds, reading the prompt (about 700 tokens)
-  about 10, and each token written about 0.4.
+| | |
+|:--|--:|
+| reading 3 files into 69 passages | 3 s |
+| reranking 20 passages | 0.6 s |
+| loading Qwen | about 6 s |
+| reading a prompt of 523 tokens | 2.5 s |
+| each token written | 49 ms |
+| a written answer from `serve`, the models loaded already | about 4.3 s |
+| a written answer from a built `ask.exe` | about 12 s |
+| a written answer with `folio run`, which compiles it first | about 25 s |
+| an answer in the documents' own sentences, from `ask.exe` | 2.7 s |
 
-Writing is slow because `onnx.folio` hands ONNX Runtime the whole cache of keys and values (24 layers, as numbers)
-on every token, and takes it back. Keeping it in ONNX Runtime's own memory between tokens would make each token
-several times faster; that's a change to `onnx.folio` itself. `serve` keeps the models loaded, so its answers
-skip the loading.
+`folio build --allow-read --allow-libraries --allow-net ask.folio` makes `ask.exe` once, in about 7 seconds, so an
+answer doesn't wait for it to be compiled, and `serve` loads the models once, so an answer doesn't wait for that
+either.
+
+Writing is fast because the keys and values stay in ONNX Runtime's memory from one token to the next
+(onnx.folio's `run_keeping`), and Qwen's table of token vectors, kept as 8-bit whole numbers, is made floats once
+when it's loaded (`load_with` with `"session.disable_quant_qdq"`), not on every token. Each token went from 277 ms
+to 49 (the best of three runs each), for about 400 MB more memory.
 
 ## Training your own retriever and reranker
 
@@ -166,7 +178,7 @@ often as MiniLM does from whole sentences, though less often from a few words. `
 | `ask.folio` | the commands: `models`, `index`, `ask`, `chat`, `serve` |
 | `documents.folio` | the text of web pages and Word documents |
 | `rerank.folio` | the cross-encoder |
-| `writer.folio` | Qwen, a token at a time, with its cache of keys and values |
+| `writer.folio` | Qwen, a token at a time, its keys and values kept in ONNX Runtime's memory |
 | `citations.folio` | citations put back from the words of each sentence |
 | `sentences.folio` | a passage's sentences, and a text's words, for quoting |
 | `knowledge.folio` | a knowledge base opened with the model it was made with |
@@ -182,8 +194,8 @@ often as MiniLM does from whole sentences, though less often from a few words. `
   sources are always shown, and `--quotes` gives the documents' own words.
 - A knowledge base is loaded whole into memory, which is fine for thousands of passages, not millions.
 - `serve` answers on 127.0.0.1 only, for the computer it runs on.
-- The writer needs memory for its 512 MB model as well as the knowledge base; beside another large job it can
-  run out.
+- The writer takes about 2.8 GB of memory with its model loaded. Two at once, or one beside another large job,
+  can run out on a 16 GB laptop, which Folio reports as a value too big to fit in memory.
 
 ## License
 
