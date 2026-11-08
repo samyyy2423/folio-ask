@@ -1,0 +1,6 @@
+# The SHA-256 of each package's files at the commit folio.packages has it at: its name, the commit and the sum.
+# folio add and update write them, and folio get checks them.
+rag 417eb66ae4c98e994c16a60f034742b5a07914dd sha256:745742f7cb4b5f6f83973981113822a7171fbc1750d39541802a45de3501c93b
+vectors c1369306dfdaa0307216ce0b3ca3471afbb858b0 sha256:98fdbc93ee446dd843d0c44df2d3e0eb9578f2b502d7d05e9e0eac70753f9d37
+tokenizer c75b22c37c44e3d7629725aa5359a4dd78d1efd6 sha256:ac04844ec609ede24b850b48e219cfb3ee789e73f4318f15cd9faae227d4b324
+pdftext c11fe0862e57be8d559f4c902236743e1053a6bb sha256:e7ee95c3a514ce24ee9e9b0e32bc43f4dc4d25d1d8cb93fa456d566661d91207

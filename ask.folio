@@ -1,0 +1,503 @@
+# Ask your docs: a folder of documents made searchable, then questions answered from it, the answer saying
+# which passage each part of it came from. Everything runs on this computer: no API, no key, no site.
+#
+#     folio run --allow-read --allow-write --allow-libraries ask.folio index docs
+#     folio run --allow-read --allow-libraries ask.folio ask "How do I install it?"
+#     folio run --allow-read --allow-libraries ask.folio chat
+#     folio run --allow-read --allow-libraries --allow-net ask.folio serve 8080   (then open http://127.0.0.1:8080)
+#
+# index reads every .pdf, .md, .markdown, .txt, .html, .htm and .docx in the folders and files it's given, cuts
+# them into chunks and keeps them in docs.rag (--kb names another), each chunk a vector from an embedding model
+# (models/all-MiniLM-L6-v2, or --model's folder; --words for words alone) and its words for BM25.
+#
+# A question finds the 20 closest chunks by meaning and by words (fused, as search engines do), then a cross-
+# encoder reads the question with each of them and puts them in order (models/ms-marco-MiniLM-L-6-v2, or
+# --reranker's). A small language model then writes the answer from the best 3, citing them as [1], [2] and [3]
+# (models/Qwen2.5-0.5B-Instruct, or --writer's). Without one, or with --quotes, the answer is the sentences in the
+# best 5 that answer it best, as they're written. `ask.folio models` fetches the three models.
+
+use the package "rag" as rag
+use "sentences.folio" as text
+use "documents.folio" as documents
+use "knowledge.folio" as knowledge
+use "citations.folio" as citations
+use "rerank.folio" as rerank
+use "writer.folio" as writer
+use "system.folio" as system
+use "server.folio" as web
+
+set kb_file to "docs.rag"
+set model_folder to "models/all-MiniLM-L6-v2"
+set reranker_folder to "models/ms-marco-MiniLM-L-6-v2"
+set writer_folder to "models/Qwen2.5-0.5B-Instruct"
+set quotes_only to no
+set command to ""
+set rest to empty list
+set k to 1
+repeat while k is at most length of arguments
+    set arg to item k of arguments
+    if arg is "--kb" and k is less than length of arguments
+        set kb_file to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--model" and k is less than length of arguments
+        set model_folder to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--reranker" and k is less than length of arguments
+        set reranker_folder to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--writer" and k is less than length of arguments
+        set writer_folder to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--words"
+        set model_folder to ""
+    else if arg is "--quotes"
+        set quotes_only to yes
+    else if command is ""
+        set command to arg
+    else
+        add arg to rest
+    end
+    set k to k + 1
+end
+
+# ---------- the models ----------
+
+# the embedder: the model's, if its folder is there, or words alone
+to embedder_for with folder
+    if folder is "" or not system's is_file(folder + "/tokenizer.json")
+        return rag's hash_embedder(256)
+    end
+    return rag's local_embedder(folder)
+end
+
+set reranker_model to nothing
+set writer_model to nothing
+
+# the reranker and the writer, each if its folder has its model, loaded once
+to load_models
+    if system's is_file(reranker_folder + "/model.onnx")
+        set reranker_model to rerank's load(reranker_folder)
+    end
+    if not quotes_only and system's is_file(writer_folder + "/model_int8.onnx")
+        set writer_model to writer's load(writer_folder)
+    end
+end
+
+# the knowledge base, with the models that answer from it loaded
+to opened
+    load_models()
+    return knowledge's opened(kb_file)
+end
+
+# ---------- index ----------
+
+set endings to list of ".pdf", ".md", ".markdown", ".txt", ".html", ".htm", ".docx"
+
+to ends_with with words, ending
+    return length of words is greater than length of ending and items (length of words - length of ending + 1) to (length of words) of words is ending
+end
+
+# the files to read under a folder, or the file itself
+to files_under with path
+    set made to empty list
+    if system's is_file(path)
+        for each ending in endings
+            if ends_with(lowercase of path, ending)
+                add path to made
+            end
+        end
+        return made
+    end
+    if not system's is_folder(path)
+        fail with "there's no file or folder called " + path
+    end
+    for each name in read the folder path
+        if name is not "." and name is not ".." and item 1 of name is not "."
+            for each found in files_under(path + "/" + name)
+                add found to made
+            end
+        end
+    end
+    return made
+end
+
+# a file's chunks added: a web page's and a Word document's text first taken from their markup
+to add_one with kb, file
+    set small to lowercase of file
+    if ends_with(small, ".html") or ends_with(small, ".htm")
+        rag's add_text(kb, documents's text_of_html(read file), file)
+    else if ends_with(small, ".docx")
+        rag's add_text(kb, documents's text_of_docx(read bytes file), file)
+    else
+        rag's add_file(kb, file)
+    end
+end
+
+to index_all with paths
+    if length of paths is 0
+        fail with "index needs a folder or files to read: ask.folio index docs"
+    end
+    set kept_model to model_folder
+    if model_folder is not "" and not system's is_file(model_folder + "/tokenizer.json")
+        say "there's no model in " + model_folder + ", so chunks are found by their words alone"
+        set kept_model to ""
+    end
+    set kb to rag's knowledge(embedder_for(kept_model))
+    set t to the clock
+    set count to 0
+    for each path in paths
+        for each file in files_under(path)
+            try
+                add_one(kb, file)
+                add 1 to count
+                say "read " + file
+            if it fails with why
+                say "left out " + file + ": " + why
+            end
+        end
+    end
+    rag's save(kb, kb_file)
+    write ((dictionary where "model" is kept_model) as json) to (kb_file + ".json")
+    say "made " + kb_file + ": " + count + " files, " + rag's size(kb) + " chunks, in " + ((the clock - t) rounded) + " s"
+end
+
+# ---------- finding ----------
+
+# the chunks for a question, best first: 20 by meaning and words, put in order by the reranker if there is one,
+# and the best `how_many` of them
+to found_for with kb, question, how_many
+    set found to rag's search(kb, question, 20)
+    if reranker_model is not nothing and length of found is greater than 1
+        set scores to rerank's scores(reranker_model, question, list of f's text for each f in found)
+        set scored to empty list
+        for each i from 1 to length of found
+            add record with found item i of found, score item i of scores to scored
+        end
+        set found to list of s's found for each s in scored in reverse order by score
+    end
+    if length of found is greater than how_many
+        return items 1 to how_many of found
+    end
+    return found
+end
+
+# ---------- answering ----------
+
+# the dot product of two vectors made 1 long: how close two meanings are, from -1 to 1
+to closeness with a, b
+    set total to 0
+    for each i from 1 to length of a
+        set total to total + item i of a * item i of b
+    end
+    return total
+end
+
+# the answer to a question from the chunks found for it, in their own words: the sentences in them that answer it
+# best, up to 3, in the order of the chunks they're from, each with that chunk's number. A sentence is scored by
+# how close its meaning is to the question's, where there's a model, and by how many of the question's words it has
+to quoted_answer with kb, question, found
+    set wanted to text's terms(question)
+    set candidates to empty list
+    for each r from 1 to length of found
+        set place to 0
+        for each s in text's sentences_of((item r of found)'s text)
+            add 1 to place
+            add record with words s, chunk r, place place, score 0 to candidates
+        end
+    end
+    if length of candidates is 0
+        return ""
+    end
+    set e to kb's embedder
+    set by_meaning to e's way is "local"
+    set vectors to empty list
+    if by_meaning
+        set texts to list of question
+        for each c in candidates
+            add c's words to texts
+        end
+        set vectors to rag's embed(e, texts)
+    end
+    for each i from 1 to length of candidates
+        set c to item i of candidates
+        set have to text's terms(c's words)
+        set shared to 0
+        for each w in wanted
+            if w is in have
+                add 1 to shared
+            end
+        end
+        set words_score to 0
+        if length of wanted is greater than 0
+            set words_score to shared / length of wanted
+        end
+        if by_meaning
+            set c's score to 0.7 * closeness(item 1 of vectors, item (i + 1) of vectors) + 0.3 * words_score
+        else
+            set c's score to words_score - 0.01 * c's chunk
+        end
+    end
+    set best to candidates in reverse order by score
+    set picked to empty list
+    for each c in best
+        if length of picked is less than 3 and c's score is greater than 0.15
+            add c to picked
+        end
+    end
+    if length of picked is 0
+        return ""
+    end
+    set ordered to empty list # in the chunks' order, and each chunk's sentences in theirs
+    for each r from 1 to length of found
+        for each c in picked in order by place
+            if c's chunk is r
+                add c to ordered
+            end
+        end
+    end
+    set made to ""
+    for each c in ordered
+        if made is not ""
+            add " " to made
+        end
+        add c's words + " [" + c's chunk + "]" to made
+    end
+    return made
+end
+
+# the answer the writer gives from the best passages, each numbered as the sources are
+to written_answer with question, found
+    set prompt to "Passages:\n\n"
+    for each r from 1 to length of found
+        add "[" + r + "] " + source_line(item r of found) + "\n" + (item r of found)'s text + "\n\n" to prompt
+    end
+    add "Question: " + question + "\n\nAnswer the question in a few sentences, using only the passages above, and cite the passages you use as [1], [2] or [3]. If they don't answer it, say so." to prompt
+    return citations's cited(writer's generated(writer_model, prompt, 220), list of f's text for each f in found)
+end
+
+# a question's answer, and the chunks it came from
+to answered with kb, question
+    if writer_model is not nothing
+        set found to found_for(kb, question, 3)
+        if length of found is 0
+            return record with words "", found found
+        end
+        return record with words written_answer(question, found), found found
+    end
+    set found to found_for(kb, question, 5)
+    return record with words quoted_answer(kb, question, found), found found
+end
+
+# where a chunk came from: its file, and its page in a PDF
+to source_line with found
+    set line to short_name(found's source)
+    if found's page is not nothing
+        add ", page " + found's page to line
+    end
+    return line
+end
+
+# a file's name without the folders it's in
+to short_name with path
+    set from to 1
+    for each i from 1 to length of path
+        if item i of path is "/" or item i of path is "\\"
+            set from to i + 1
+        end
+    end
+    return items from to (length of path) of path
+end
+
+# a question's answer and sources, as lines to say
+to reply_to with kb, question
+    set reply to answered(kb, question)
+    if length of reply's found is 0
+        return list of "There's nothing in " + kb_file + " yet."
+    end
+    set lines to empty list
+    if reply's words is ""
+        add "Nothing in the documents answers that well. The closest:" to lines
+    else
+        add reply's words to lines
+    end
+    add "" to lines
+    add "Sources:" to lines
+    for each r from 1 to length of reply's found
+        add "  [" + r + "] " + source_line(item r of reply's found) to lines
+    end
+    return lines
+end
+
+# what's answering: the models in use, a line
+to helpers_line
+    set made to "found by "
+    if model_folder is not ""
+        add "meaning and words" to made
+    else
+        add "words" to made
+    end
+    if reranker_model is not nothing
+        add ", put in order by " + short_name(reranker_folder) to made
+    end
+    if writer_model is not nothing
+        add ", answered by " + short_name(writer_folder) to made
+    else
+        add ", answered in the documents' own sentences" to made
+    end
+    return made
+end
+
+# ---------- the page ----------
+
+to escaped with words
+    set made to ""
+    for each c in words
+        if c is "&"
+            add "&amp;" to made
+        else if c is "<"
+            add "&lt;" to made
+        else if c is ">"
+            add "&gt;" to made
+        else if c is "\""
+            add "&quot;" to made
+        else if c is "\n"
+            add "<br>" to made
+        else
+            add c to made
+        end
+    end
+    return made
+end
+
+set page_style to "body\{font-family:system-ui,sans-serif;max-width:46rem;margin:3rem auto;padding:0 1rem;line-height:1.55;color:#1d1d1f}" +
+    "input\{width:75%;padding:.6rem;font-size:1rem;border:1px solid #bbb;border-radius:8px}" +
+    "button\{padding:.6rem 1rem;font-size:1rem;border:0;border-radius:8px;background:#1d1d1f;color:#fff}" +
+    ".answer\{background:#f4f4f6;border-radius:10px;padding:1rem 1.2rem;margin:1.5rem 0}.src\{color:#555;font-size:.92rem}" +
+    "details\{margin:.4rem 0}summary\{cursor:pointer}"
+
+# the page: a box for the question and, once one is asked, its answer, its sources, and each source's chunk
+to page_for with kb, question
+    set html to "<!doctype html><html><head><meta charset=\"utf-8\"><title>Ask your docs</title><style>" + page_style + "</style></head><body>"
+    add "<h1>Ask your docs</h1><form method=\"get\" action=\"/\"><input name=\"q\" autofocus placeholder=\"Ask a question\" value=\"" + escaped(question) + "\"> <button>Ask</button></form>" to html
+    if question is not ""
+        set reply to answered(kb, question)
+        set said to reply's words
+        if said is ""
+            set said to "Nothing in the documents answers that well. The closest passages are below."
+        end
+        add "<div class=\"answer\">" + escaped(said) + "</div><div class=\"src\"><b>Sources</b>" to html
+        for each r from 1 to length of reply's found
+            set f to item r of reply's found
+            add "<details><summary>[" + r + "] " + escaped(source_line(f)) + "</summary><p>" + escaped(f's text) + "</p></details>" to html
+        end
+        add "</div>" to html
+    end
+    add "<p class=\"src\">" + rag's size(kb) + " chunks from " + length of rag's sources(kb) + " files, " + helpers_line() + ", all on this computer.</p></body></html>" to html
+    return html
+end
+
+# ---------- the models ----------
+
+set downloads to empty list
+
+# a model's files to fetch: from Hugging Face's address for it, each into its folder under its own name
+to wanted with folder, address, names
+    add record with folder folder, address address, names names to downloads
+end
+
+wanted(model_folder, "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/", list of "onnx/model.onnx", "tokenizer.json")
+wanted(reranker_folder, "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/", list of "onnx/model.onnx", "tokenizer.json")
+wanted(writer_folder, "https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct/resolve/main/", list of "onnx/model_int8.onnx", "tokenizer.json", "config.json")
+
+# each model's files fetched with curl, unless they're here already (about 700 MB in all), then the writer's
+# relabelled for the ONNX Runtime that comes with Windows
+to get_models
+    for each d in downloads
+        if d's folder is not ""
+            system's make_folder(d's folder)
+            for each name in d's names
+                set file to d's folder + "/" + short_name(name)
+                if system's is_file(file) and system's file_size(file) is greater than 0
+                    say "have " + file
+                else
+                    say "fetching " + file
+                    set code to run program "curl" with (list of "-fsSL", "--retry", "3", "-o", file, d's address + name)
+                    if code is not 0
+                        fail with "curl couldn't fetch " + d's address + name + " (it ended with " + code + ")"
+                    end
+                end
+            end
+        end
+    end
+    relabelled(writer_folder + "/model_int8.onnx")
+end
+
+# Qwen's ONNX file says it's of ONNX's format 10, and the ONNX Runtime that comes with Windows 11 (1.17) reads
+# up to 9. It uses nothing 10 added (only ONNX's own operators, of opset 14), so its first field, the format's
+# number, is made 9: one byte, written back
+to relabelled with file
+    if not system's is_file(file)
+        return nothing
+    end
+    set data to read bytes file
+    if byte 1 of data is 8 and byte 2 of data is 10
+        set byte 2 of data to 9
+        write data to file
+        say "relabelled " + file + " as ONNX's format 9, for Windows' ONNX Runtime"
+    end
+end
+
+# ---------- the commands ----------
+
+if command is "models"
+    get_models()
+else if command is "index"
+    index_all(rest)
+else if command is "ask"
+    if length of rest is 0
+        fail with "ask needs a question: ask.folio ask \"How do I install it?\""
+    end
+    set question to join rest with " "
+    set kb to opened()
+    for each line in reply_to(kb, question)
+        say line
+    end
+else if command is "chat"
+    set kb to opened()
+    say "Ask about the " + length of rag's sources(kb) + " files in " + kb_file + ", " + helpers_line() + " (an empty line ends it)."
+    set going to yes
+    repeat while going
+        set question to ask "> "
+        if question is nothing or question is ""
+            set going to no
+        else
+            for each line in reply_to(kb, question)
+                say line
+            end
+            say ""
+        end
+    end
+else if command is "serve"
+    set kb to opened()
+    set port to 8080
+    if length of rest is at least 1
+        set port to number of (item 1 of rest)
+    end
+    to answer_request with request
+        set question to ""
+        if "q" is in request's query
+            set question to item "q" of request's query
+        end
+        if request's path is "/"
+            return page_for(kb, question)
+        end
+        return record with status 404, body "There's nothing here but / ."
+    end
+    say "Ask your docs at http://127.0.0.1:" + port + ", " + helpers_line()
+    web's serve(port, answer_request)
+else
+    say "ask.folio models                     (fetches the three models into models/, about 700 MB)"
+    say "ask.folio index <folders or files> [--model <folder> | --words] [--kb docs.rag]"
+    say "ask.folio ask \"a question\"   |   ask.folio chat   |   ask.folio serve [port]"
+    say "  [--reranker <folder>] [--writer <folder>] [--quotes]"
+end

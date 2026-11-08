@@ -1,0 +1,111 @@
+# A cross-encoder reranker, as search engines put after their first search: the question and a passage read
+# together by one model (ms-marco-MiniLM-L-6-v2, trained on Bing's questions and the passages that answered
+# them), which says how well the passage answers it. Slower than comparing vectors, so it reorders the few a
+# first search found.
+#
+#   use "rerank.folio" as rerank
+#   set r to rerank's load("models/ms-marco-MiniLM-L-6-v2")      # its model.onnx and tokenizer.json
+#   say rerank's scores(r, "How do I install it?", list of "Run the installer.", "It's written in Folio.")
+
+use "onnx.folio" as rr_onnx
+use "arrays.folio" as rr_arrays
+use the package "tokenizer" as rr_tokenizer
+
+# a reranker from a folder with the model (model.onnx, or onnx/model.onnx) and its tokenizer.json
+to load with folder
+    set model_file to folder + "/model.onnx"
+    set tok to rr_tokenizer's load_hugging_face(folder + "/tokenizer.json")
+    return record with kind "reranker", model rr_onnx's load(model_file), tokenizer tok, longest 512, batch 8
+end
+
+# how well each passage answers the question: a number for each, higher for better (a logit, not a chance)
+to scores with r, question, passages
+    set question_ids to rr_tokenizer's encode(r's tokenizer, question) # [CLS] the question [SEP]
+    if length of question_ids is greater than 64
+        set last_id to item (length of question_ids) of question_ids
+        set question_ids to items 1 to 63 of question_ids
+        add last_id to question_ids
+    end
+    set made to empty list
+    set k to 1
+    repeat while k is at most length of passages
+        set upto to k + r's batch - 1
+        if upto is greater than length of passages
+            set upto to length of passages
+        end
+        for each s in rr_batch(r, question_ids, items k to upto of passages)
+            add s to made
+        end
+        set k to upto + 1
+    end
+    return made
+end
+
+# a batch of pairs, each [CLS] question [SEP] passage [SEP], the passage's tokens of type 1, cut to fit
+to rr_batch with r, question_ids, passages
+    set rows to empty list
+    set kinds to empty list
+    set longest to 0
+    for each passage in passages
+        set passage_ids to rr_tokenizer's encode(r's tokenizer, passage)
+        set room to r's longest - length of question_ids
+        set rest to items 2 to (length of passage_ids) of passage_ids # without its [CLS]
+        if length of rest is greater than room
+            set last_id to item (length of rest) of rest
+            set rest to items 1 to (room - 1) of rest
+            add last_id to rest
+        end
+        set ids to empty list
+        set types to empty list
+        for each id in question_ids
+            add id to ids
+            add 0 to types
+        end
+        for each id in rest
+            add id to ids
+            add 1 to types
+        end
+        add ids to rows
+        add types to kinds
+        if length of ids is greater than longest
+            set longest to length of ids
+        end
+    end
+    set ids_in to empty list
+    set masks to empty list
+    set types_in to empty list
+    for each b from 1 to length of rows
+        set ids to item b of rows
+        set p to empty list
+        set m to empty list
+        set z to empty list
+        for each t from 1 to longest
+            if t is at most length of ids
+                add item t of ids to p
+                add 1 to m
+                add item t of item b of kinds to z
+            else
+                add 0 to p
+                add 0 to m
+                add 0 to z
+            end
+        end
+        add p to ids_in
+        add m to masks
+        add z to types_in
+    end
+    set inputs to dictionary where "input_ids" is rr_arrays's array(ids_in), "attention_mask" is rr_arrays's array(masks)
+    for each wanted in rr_onnx's inputs(r's model)
+        if wanted's name is "token_type_ids"
+            set item "token_type_ids" of inputs to rr_arrays's array(types_in)
+        end
+    end
+    set out to rr_onnx's run(r's model, inputs)
+    set logits to nothing
+    for each name in keys of out
+        if logits is nothing
+            set logits to item name of out
+        end
+    end
+    return rr_arrays's numbers_of(logits)
+end

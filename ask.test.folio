@@ -1,0 +1,128 @@
+# Tests that need no model: reading web pages and Word documents, citations, sentences, and finding a model's
+# folder.
+#
+#     folio test --allow-read --allow-libraries ask.test.folio
+
+use "documents.folio" as documents
+use "citations.folio" as citations
+use "sentences.folio" as text
+use "knowledge.folio" as knowledge
+use "zip.folio" as zip
+
+# ---------- web pages ----------
+
+to test_html_keeps_words_and_blocks
+    set page to "<html><head><title>T</title><style>p \{ color: red }</style></head><body><h1>Leave</h1><p>Staff get <b>25 days</b> a year.</p><ul><li>Ask first</li><li>Keep a note</li></ul></body></html>"
+    expect documents's text_of_html(page) is "T\n\nLeave\n\nStaff get 25 days a year.\n\nAsk first\n\nKeep a note"
+end
+
+to test_html_leaves_out_scripts
+    set page to "<p>before</p><script>var x = \"<p>not this</p>\";</script><noscript>nor this</noscript><p>after</p>"
+    expect documents's text_of_html(page) is "before\n\nafter"
+end
+
+to test_html_entities
+    expect documents's text_of_html("<p>A &amp; B &lt;3 &quot;q&quot; &#39;s &#65;&nbsp;C &bogus; &amp</p>") is "A & B <3 \"q\" 's A C &bogus; &amp"
+end
+
+to test_html_spaces_made_one
+    expect documents's text_of_html("<div>  one\n   two  </div>\n\n\n<div>three</div>") is "one\ntwo\n\nthree"
+end
+
+# ---------- Word documents ----------
+
+# a .docx of these paragraphs, each a list of runs: a zip with word/document.xml
+to docx_of with paragraphs
+    set xml to "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>"
+    for each runs in paragraphs
+        add "<w:p>" to xml
+        for each run in runs
+            if run is "\t"
+                add "<w:r><w:tab/></w:r>" to xml
+            else
+                add "<w:r><w:t xml:space=\"preserve\">" + run + "</w:t></w:r>" to xml
+            end
+        end
+        add "</w:p>" to xml
+    end
+    add "</w:body></w:document>" to xml
+    return zip's zipped((list of "[Content_Types].xml", "word/document.xml"), (list of "<Types/>", xml))
+end
+
+to test_docx_paragraphs_and_runs
+    set data to docx_of(list of (list of "Holiday ", "policy"), (list of "Staff get 25 days &amp; more."), (list of "a", "\t", "b"))
+    expect documents's text_of_docx(data) is "Holiday policy\n\nStaff get 25 days & more.\n\na b"
+end
+
+to test_docx_needs_its_document
+    set data to zip's zipped((list of "notes.txt"), (list of "hello"))
+    set said to ""
+    try
+        documents's text_of_docx(data)
+    if it fails with why
+        set said to why
+    end
+    expect "no word/document.xml" is in said
+end
+
+# ---------- citations ----------
+
+to test_citation_added_to_the_passage_with_the_words
+    set passages to list of "Sounds play one after another.", "Staff get 25 days of paid leave a year. Ask your manager at least two weeks ahead."
+    expect citations's cited("You need to give at least two weeks notice before taking leave.", passages) is "You need to give at least two weeks notice before taking leave [2]."
+end
+
+to test_citations_each_sentence
+    set passages to list of "A sound lasts from 0 to 60 seconds.", "remove takes a key out of a dictionary."
+    expect citations's cited("A sound lasts up to 60 seconds. Use remove to take a key out of a dictionary!", passages) is "A sound lasts up to 60 seconds [1]. Use remove to take a key out of a dictionary [2]!"
+end
+
+to test_no_citation_without_enough_words
+    expect citations's cited("Bonjour.", list of "A sound lasts from 0 to 60 seconds.") is "Bonjour."
+end
+
+to test_citations_kept_where_the_model_gave_them
+    expect citations's cited("It lasts a minute [2].", list of "lasts minute", "lasts minute") is "It lasts a minute [2]."
+end
+
+to test_dots_inside_words_end_no_sentence
+    expect citations's cited("Use json.folio to read JSON files", list of "json.folio reads JSON files") is "Use json.folio to read JSON files [1]"
+end
+
+# ---------- sentences ----------
+
+to test_terms_leave_out_common_words
+    expect text's terms("How do I install it on Windows?") is list of "install", "windows"
+end
+
+to test_sentences_skip_headings_and_code
+    set chunk to "# Install\n\nRun the installer from the release page. It takes about a minute on a laptop.\n\n```\nfolio run hello.folio\n```\n\nThen open a new terminal window."
+    expect text's sentences_of(chunk) is list of "Run the installer from the release page.", "It takes about a minute on a laptop.", "Then open a new terminal window."
+end
+
+to test_sentences_join_lines_and_drop_short_ones
+    set chunk to "Each chunk is cut where a paragraph\nends, and lines are joined. Too short.\n- A list item starts a paragraph of its own."
+    expect text's sentences_of(chunk) is list of "Each chunk is cut where a paragraph ends, and lines are joined.", "A list item starts a paragraph of its own."
+end
+
+to test_sentences_drop_a_first_sentence_cut_in_two
+    expect text's sentences_of("the end of a sentence from the chunk before. The next one is whole and kept.") is list of "The next one is whole and kept."
+end
+
+# ---------- finding a model ----------
+
+to test_file_name
+    expect knowledge's file_name("models/all-MiniLM-L6-v2") is "all-MiniLM-L6-v2"
+    expect knowledge's file_name("C:\\docs\\folio.rag") is "folio.rag"
+    expect knowledge's file_name("docs.rag") is "docs.rag"
+end
+
+to test_missing_model_says_where_it_looked
+    set said to ""
+    try
+        knowledge's model_found("nowhere/docs.rag", "no-such-model")
+    if it fails with why
+        set said to why
+    end
+    expect "no-such-model" is in said and "models/" is in said
+end

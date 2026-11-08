@@ -1,0 +1,527 @@
+# A retriever and a reranker trained on your own documents, in Folio, with learn.folio, from a knowledge base
+# ask.folio index made, and how well each finds the chunk a question came from, beside BM25 and the model the
+# knowledge base was made with (all-MiniLM-L6-v2, say).
+#
+#     folio run --allow-read --allow-write --allow-libraries train.folio [--kb docs.rag] [--steps 1500]
+#
+# The questions are the documents' own sentences: each, taken as a question, should find the chunk it's in. A
+# tenth of them are kept back to test with. The retriever is a byte-level BPE learned from the chunks, each
+# token a vector, a text's vectors averaged, then a layer, then made 1 long; it learns from batches of questions
+# and their chunks, each question's own chunk to score above every other chunk in its batch (InfoNCE, as
+# sentence-transformers train). The reranker is a logistic regression over what each way of finding says of a
+# chunk (BM25's score, the model's closeness, the trained retriever's, the words shared, and each one's rank),
+# which learns which chunk of the closest few is the one. Both are saved in trained/, which ask.folio uses.
+
+use the package "rag" as rag
+use "sentences.folio" as text
+use "learn.folio" as learn
+use "arrays.folio" as arrays
+use "math.folio" as math
+use "system.folio" as system
+use "knowledge.folio" as knowledge
+use the package "tokenizer" as tokenizer
+
+set kb_file to "docs.rag"
+set steps to 600
+set k to 1
+repeat while k is at most length of arguments
+    set arg to item k of arguments
+    if arg is "--kb" and k is less than length of arguments
+        set kb_file to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--steps" and k is less than length of arguments
+        set steps to number of (item (k + 1) of arguments)
+        set k to k + 1
+    end
+    set k to k + 1
+end
+set width to 128 # numbers in a vector
+set vocabulary to 4096 # BPE tokens: the 256 bytes, and merges learned from the chunks
+set longest to 128 # tokens of a chunk the retriever reads
+set batch to 64
+set temperature to 0.05
+
+# ---------- the knowledge base and the questions ----------
+
+set kb to knowledge's opened(kb_file)
+set folder to "" # the model it was made with, as its settings file names it
+if system's is_file(kb_file + ".json")
+    set folder to item "model" of (json from read (kb_file + ".json"))
+end
+set chunks to rag's all_chunks(kb)
+set slot_of to empty dictionary # a chunk's id, to its place in chunks
+for each c from 1 to length of chunks
+    set item (item c of chunks)'s id of slot_of to c
+end
+
+set seed to 20261108
+to next_random
+    set seed to remainder of (seed * 16807) divided by 2147483647
+    return seed / 2147483647
+end
+
+set pairs to empty list # each sentence of 6 words or more, with the chunk it's in
+for each c from 1 to length of chunks
+    for each s in text's sentences_of((item c of chunks)'s text)
+        if length of text's terms(s) is at least 6
+            add record with question s, chunk c to pairs
+        end
+    end
+end
+set kept to empty list # every tenth, at most 300, to test with
+set learning to empty list
+for each i from 1 to length of pairs
+    if remainder of i divided by 10 is 0 and length of kept is less than 300
+        add item i of pairs to kept
+    else
+        add item i of pairs to learning
+    end
+end
+say "" + length of chunks + " chunks; " + length of learning + " questions to learn from, " + length of kept + " to test with"
+
+# ---------- tokens ----------
+
+set t0 to the clock
+set chunk_texts to list of c's text for each c in chunks
+set tok to tokenizer's train(chunk_texts, vocabulary)
+to tokens_of with words
+    set ids to tokenizer's encode(tok, words)
+    if length of ids is greater than longest
+        return items 1 to longest of ids
+    end
+    if length of ids is 0
+        return list of 32
+    end
+    return ids
+end
+set chunk_tokens to list of tokens_of(c) for each c in chunk_texts
+say "learned " + vocabulary + " tokens in " + ((the clock - t0) rounded) + " s"
+
+# ---------- the retriever ----------
+
+learn's use_card(no)
+learn's use_floats(yes)
+set table to learn's parameter(learn's random_normal(vocabulary, width, 0.1))
+set layer to learn's parameter(learn's random_normal(width, width, 1 / math's sqrt(width)))
+
+# each row made 1 long, as an operation of learn's own (see learn's custom): forward, and its gradient,
+# (g - y (g . y)) / |x| for each row
+to unit_rows with xs
+    set x to item 1 of xs
+    set numbers to learn's numbers_of(x)
+    set made to empty list
+    for each r from 0 to x's rows - 1
+        set total to 0
+        for each c from 1 to x's columns
+            set v to item (r * x's columns + c) of numbers
+            set total to total + v * v
+        end
+        set size to math's sqrt(total) + 0.000000001
+        for each c from 1 to x's columns
+            add item (r * x's columns + c) of numbers / size to made
+        end
+    end
+    return learn's matrix_of(made, x's rows, x's columns)
+end
+
+to unit_rows_back with g, xs, y
+    set x to item 1 of xs
+    set xn to learn's numbers_of(x)
+    set gn to learn's numbers_of(g)
+    set yn to learn's numbers_of(y)
+    set made to empty list
+    set n to x's columns
+    for each r from 0 to x's rows - 1
+        set total to 0
+        set along to 0
+        for each c from 1 to n
+            set v to item (r * n + c) of xn
+            set total to total + v * v
+            set along to along + item (r * n + c) of gn * item (r * n + c) of yn
+        end
+        set size to math's sqrt(total) + 0.000000001
+        for each c from 1 to n
+            add (item (r * n + c) of gn - item (r * n + c) of yn * along) / size to made
+        end
+    end
+    return list of learn's matrix_of(made, x's rows, n)
+end
+
+# each of a's rows with each of b's, a times b turned over, and its gradients, g b and g turned over times a
+to scores with xs
+    set a to item 1 of xs
+    set b to item 2 of xs
+    set product to arrays's matmul(a's data, arrays's transpose(b's data))
+    return learn's matrix_of(arrays's numbers_of(product), a's rows, b's rows)
+end
+
+to scores_back with g, xs, made
+    set a to item 1 of xs
+    set b to item 2 of xs
+    set ga to arrays's matmul(g's data, b's data)
+    set gb to arrays's matmul_turned(g's data, a's data)
+    return list of learn's matrix_of(arrays's numbers_of(ga), a's rows, a's columns), learn's matrix_of(arrays's numbers_of(gb), b's rows, b's columns)
+end
+
+# texts' vectors, each a list of token ids: their tokens' vectors averaged (a matrix that averages each text's
+# rows, times the rows), then the layer, then each made 1 long
+to encoded with token_lists
+    set ids to empty list
+    for each t in token_lists
+        for each id in t
+            add id to ids
+        end
+    end
+    set averaging to empty list
+    set before to 0
+    for each t in token_lists
+        for each j from 1 to length of ids
+            if j is greater than before and j is at most before + length of t
+                add 1 / length of t to averaging
+            else
+                add 0 to averaging
+            end
+        end
+        set before to before + length of t
+    end
+    set averages to learn's matmul(learn's matrix_of(averaging, length of token_lists, length of ids), learn's embedding(table, ids))
+    return learn's custom([learn's matmul(averages, layer)], unit_rows, unit_rows_back)
+end
+
+# ---------- learning ----------
+
+# a question as someone might type it: half the time a few of its words that matter, each kept at a chance of
+# a half, and otherwise the sentence with a word in three left out, so the retriever learns from what a
+# question shares with its chunk in meaning, not from the sentence word for word
+to varied with sentence
+    set made to empty list
+    if next_random() is less than 0.5
+        for each w in text's terms(sentence)
+            if next_random() is less than 0.5 or length of made is less than 2
+                add w to made
+            end
+        end
+    else
+        for each w in split sentence by " "
+            if next_random() is at least 0.33
+                add w to made
+            end
+        end
+    end
+    if length of made is 0
+        return sentence
+    end
+    return join made with " "
+end
+
+set opt to learn's adamw([table, layer], 0.003, 0.01)
+set labels to empty list # each question's own chunk is the one in its place
+for each i from 0 to batch - 1
+    add i to labels
+end
+set t0 to the clock
+for each s from 1 to steps
+    set questions to empty list
+    set their_chunks to empty list
+    set taken to empty dictionary # one question a chunk in a batch, so no other is a right answer too
+    repeat while length of questions is less than batch
+        set p to item (((next_random() * length of learning) rounded down) + 1) of learning
+        if not (p's chunk is in taken)
+            set item p's chunk of taken to yes
+            add tokens_of(varied(p's question)) to questions
+            add item p's chunk of chunk_tokens to their_chunks
+        end
+    end
+    set q to encoded(questions)
+    set c to encoded(their_chunks)
+    set logits to learn's times(learn's custom([q, c], scores, scores_back), 1 / temperature)
+    set loss to learn's cross_entropy(logits, labels)
+    learn's backward(loss)
+    if s is 1 or remainder of s divided by 250 is 0
+        say "step " + s + ": loss " + ((learn's value(loss) * 1000) rounded) / 1000 + " (" + ((the clock - t0) rounded) + " s)"
+    end
+    learn's step(opt)
+end
+say "learned in " + ((the clock - t0) rounded) + " s"
+
+# every chunk's vector from the trained retriever, a list of numbers each
+to vectors_of with token_lists
+    set made to empty list
+    set i to 1
+    repeat while i is at most length of token_lists
+        set upto to i + 127
+        if upto is greater than length of token_lists
+            set upto to length of token_lists
+        end
+        set m to encoded(items i to upto of token_lists)
+        set numbers to learn's numbers_of(m)
+        for each r from 0 to m's rows - 1
+            add items (r * width + 1) to (r * width + width) of numbers to made
+        end
+        learn's forget()
+        set i to upto + 1
+    end
+    return made
+end
+
+to dot with a, b
+    set total to 0
+    for each i from 1 to length of a
+        set total to total + item i of a * item i of b
+    end
+    return total
+end
+
+set chunk_vectors to vectors_of(chunk_tokens)
+
+# the trained retriever's closest chunks to a question, as places in chunks, with their scores
+to trained_search with question, how_many
+    set qv to item 1 of vectors_of(list of tokens_of(question))
+    set scored to empty list
+    for each c from 1 to length of chunks
+        add record with chunk c, score dot(qv, item c of chunk_vectors) to scored
+    end
+    set scored to scored in reverse order by score
+    return items 1 to how_many of scored
+end
+
+# ---------- what each way finds ----------
+
+to places_of with found
+    return list of item f's id of slot_of for each f in found
+end
+
+to rank_in with places, wanted
+    for each r from 1 to length of places
+        if item r of places is wanted
+            return r
+        end
+    end
+    return 0
+end
+
+# a question's 20 closest chunks by each way: BM25's, the model's (where the knowledge base has one) and the
+# trained retriever's, each a list of places in chunks, and their scores by place
+to lists_for with question
+    set made to record with words empty list, word_scores empty dictionary, meaning empty list, meaning_scores empty dictionary,
+        trained empty list, trained_scores empty dictionary
+    for each f in rag's search_by(kb, question, 20, "words")
+        set place to item f's id of slot_of
+        add place to made's words
+        set item ("" + place) of made's word_scores to f's score
+    end
+    if folder is not ""
+        for each f in rag's search_by(kb, question, 20, "meaning")
+            set place to item f's id of slot_of
+            add place to made's meaning
+            set item ("" + place) of made's meaning_scores to f's score
+        end
+    end
+    for each f in trained_search(question, 20)
+        add f's chunk to made's trained
+        set item ("" + f's chunk) of made's trained_scores to f's score
+    end
+    return made
+end
+
+# reciprocal rank fusion of ranked lists, as rag's search fuses: places, best first
+to fused_of with lists
+    set fused to empty dictionary
+    for each ranked in lists
+        for each r from 1 to length of ranked
+            set place to "" + item r of ranked
+            set gained to 1 / (60 + r)
+            if place is in fused
+                set item place of fused to item place of fused + gained
+            else
+                set item place of fused to gained
+            end
+        end
+    end
+    set best to list of (record with chunk number of key, score item key of fused) for each key in keys of fused
+    return list of b's chunk for each b in best in reverse order by score
+end
+
+# ---------- the reranker ----------
+
+# what the three ways say of one chunk for a question: each one's score (BM25's over its best), the share of
+# the question's words in the chunk, and 1 over each one's rank (0 where it isn't in the first 20)
+to features_of with question, lists, place
+    set key to "" + place
+    set top to 0
+    for each name in keys of lists's word_scores
+        if item name of lists's word_scores is greater than top
+            set top to item name of lists's word_scores
+        end
+    end
+    set f to empty list
+    if key is in lists's word_scores and top is greater than 0
+        add item key of lists's word_scores / top to f
+    else
+        add 0 to f
+    end
+    for each scores_by in list of lists's meaning_scores, lists's trained_scores
+        if key is in scores_by
+            add item key of scores_by to f
+        else
+            add 0 to f
+        end
+    end
+    set wanted to text's terms(question)
+    set have to text's terms((item place of chunks)'s text)
+    set shared to 0
+    for each w in wanted
+        if w is in have
+            add 1 to shared
+        end
+    end
+    if length of wanted is greater than 0
+        add shared / length of wanted to f
+    else
+        add 0 to f
+    end
+    for each ranked in list of lists's words, lists's meaning, lists's trained
+        set r to rank_in(ranked, place)
+        if r is 0
+            add 0 to f
+        else
+            add 1 / r to f
+        end
+    end
+    return f
+end
+
+# the chunks a reranker looks at for a question: the first 10 of each way's, each once
+to candidates_of with lists
+    set made to empty list
+    set seen to empty dictionary
+    for each ranked in list of lists's words, lists's meaning, lists's trained
+        set upto to 10
+        if length of ranked is less than upto
+            set upto to length of ranked
+        end
+        for each r from 1 to upto
+            set place to item r of ranked
+            if not (("" + place) is in seen)
+                set item ("" + place) of seen to yes
+                add place to made
+            end
+        end
+    end
+    return made
+end
+
+# a terse question from a sentence: every other one of its words that matter, as someone typing a search might
+to terse with sentence
+    set made to empty list
+    set i to 0
+    for each w in text's terms(sentence)
+        add 1 to i
+        if remainder of i divided by 2 is 1
+            add w to made
+        end
+    end
+    return join made with " "
+end
+
+set feature_count to 7
+set rows to empty list
+set labels_r to empty list
+set examples to 0
+for each n from 1 to 600
+    set p to item (((next_random() * length of learning) rounded down) + 1) of learning
+    set question to p's question
+    if remainder of n divided by 2 is 0
+        set question to terse(question)
+    end
+    set lists to lists_for(question)
+    for each place in candidates_of(lists)
+        for each v in features_of(question, lists, place)
+            add v to rows
+        end
+        if place is p's chunk
+            add 1 to labels_r
+        else
+            add 0 to labels_r
+        end
+        add 1 to examples
+    end
+    learn's forget()
+end
+set weights to learn's parameter(learn's random_normal(feature_count, 2, 0.1))
+set bias to learn's parameter(learn's zeros(1, 2))
+set x to learn's matrix_of(rows, examples, feature_count)
+set ropt to learn's adam([weights, bias], 0.05)
+for each round from 1 to 300
+    set loss to learn's cross_entropy(learn's add_row(learn's matmul(x, weights), bias), labels_r)
+    learn's backward(loss)
+    if round is 300
+        say "reranker: " + examples + " chunks of 600 questions, loss " + ((learn's value(loss) * 1000) rounded) / 1000
+    end
+    learn's step(ropt)
+end
+set w_numbers to learn's numbers_of(weights)
+set b_numbers to learn's numbers_of(bias)
+
+# the reranker's order for a question's candidates: by how much more it says it's the one than not
+to reranked with question, lists
+    set scored to empty list
+    for each place in candidates_of(lists)
+        set f to features_of(question, lists, place)
+        set yes_score to item 2 of b_numbers - item 1 of b_numbers
+        for each i from 1 to feature_count
+            set yes_score to yes_score + item i of f * (item (2 * i) of w_numbers - item (2 * i - 1) of w_numbers)
+        end
+        add record with chunk place, score yes_score to scored
+    end
+    return list of s's chunk for each s in scored in reverse order by score
+end
+
+# ---------- how well each finds the chunk ----------
+
+set ways to list of "BM25", "the model (" + folder + ")", "BM25 and the model", "trained in Folio", "trained and BM25",
+    "all three, reranked"
+for each terse_test in list of no, yes
+    set hits1 to list of 0, 0, 0, 0, 0, 0
+    set hits5 to list of 0, 0, 0, 0, 0, 0
+    for each p in kept
+        set question to p's question
+        if terse_test
+            set question to terse(question)
+        end
+        set lists to lists_for(question)
+        set orders to list of lists's words, lists's meaning, fused_of(list of lists's words, lists's meaning), lists's trained,
+            fused_of(list of lists's words, lists's trained), reranked(question, lists)
+        for each w from 1 to 6
+            set r to rank_in(item w of orders, p's chunk)
+            if r is 1
+                set item w of hits1 to item w of hits1 + 1
+            end
+            if r is at least 1 and r is at most 5
+                set item w of hits5 to item w of hits5 + 1
+            end
+        end
+        learn's forget()
+    end
+    say ""
+    if terse_test
+        say "terse questions (every other word that matters): found first, and in the first 5, of " + length of kept
+    else
+        say "sentences as written: found first, and in the first 5, of " + length of kept + " it hadn't learned from"
+    end
+    for each w from 1 to 6
+        if folder is not "" or w is 1 or w is 4 or w is 5 or w is 6
+            say "  " + item w of ways + ": " + ((item w of hits1 / length of kept * 1000) rounded) / 10 + "%, " + ((item w of hits5 / length of kept * 1000) rounded) / 10 + "%"
+        end
+    end
+end
+
+# ---------- saving ----------
+
+if not system's is_folder("trained")
+    system's make_folder("trained")
+end
+learn's save((dictionary where "table" is table, "layer" is layer), "trained/retriever.safetensors", "F16")
+tokenizer's save(tok, "trained/tokens.tiktoken")
+write ((dictionary where "weights" is w_numbers, "bias" is b_numbers, "model" is folder) as json) to "trained/reranker.json"
+say "saved trained/retriever.safetensors, trained/tokens.tiktoken and trained/reranker.json"

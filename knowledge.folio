@@ -1,0 +1,50 @@
+# A knowledge base `ask.folio index` made, opened with the embedding model it was made with. Its settings file,
+# beside it (docs.rag.json), names the model's folder as it was given to index; the folder is looked for as it
+# was given, then in models/, then beside the knowledge base, so a knowledge base still opens from another folder.
+#
+#   use "knowledge.folio" as knowledge
+#   set kb to knowledge's opened("docs.rag")
+
+use the package "rag" as kn_rag
+use "system.folio" as kn_system
+
+# the knowledge base, with its embedding model (or words alone, if it was made without one)
+to opened with kb_file
+    if not kn_system's is_file(kb_file)
+        fail with "there's no " + kb_file + " yet: make it with `ask.folio index <folder>`"
+    end
+    set folder to ""
+    if kn_system's is_file(kb_file + ".json")
+        set folder to item "model" of (json from read (kb_file + ".json"))
+    end
+    if folder is ""
+        return kn_rag's load(kb_file, kn_rag's hash_embedder(256))
+    end
+    return kn_rag's load(kb_file, kn_rag's local_embedder(model_found(kb_file, folder)))
+end
+
+# where the model a knowledge base was made with is now
+to model_found with kb_file, folder
+    set kb_folder to "."
+    set name to file_name(kb_file)
+    if length of name is less than length of kb_file
+        set kb_folder to items 1 to (length of kb_file - length of name - 1) of kb_file
+    end
+    for each place in list of folder, "models/" + file_name(folder), kb_folder + "/" + folder
+        if kn_system's is_file(place + "/tokenizer.json")
+            return place
+        end
+    end
+    fail with kb_file + " was made with the model in " + folder + ", which isn't there, in models/ or beside it"
+end
+
+# a file's name without the folders it's in
+to file_name with path
+    set from to 1
+    for each i from 1 to length of path
+        if item i of path is "/" or item i of path is "\\"
+            set from to i + 1
+        end
+    end
+    return items from to (length of path) of path
+end

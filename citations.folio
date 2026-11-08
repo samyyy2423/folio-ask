@@ -1,0 +1,75 @@
+# Citations put back where a small model left them out: each sentence of an answer without a [n] gets the
+# number of the passage that has the most of its words, if that's at least 2 in 5 of them. It goes by words
+# alone, so it says where a sentence's words came from, not that the passage says what the sentence does.
+#
+#   use "citations.folio" as citations
+#   say citations's cited("Staff get 25 days a year.", list of "Holiday policy: 25 days of paid leave a year.")
+#   # Staff get 25 days a year [1].
+
+use "sentences.folio" as ct_text
+
+# the answer with a [n] after each sentence that has none: the passage with the most of its words (by their first
+# 5 letters, so "weeks" and "week" are one), if that's at least 2 in 5 of them. A small model often leaves its
+# citations out, and this puts them back from the words alone
+to cited with answer, texts
+    set passages to list of stems(ct_text's terms(t)) for each t in texts
+    set made to ""
+    set sentence to ""
+    set chars to split answer by ""
+    for each i from 1 to length of chars
+        set c to item i of chars
+        add c to sentence
+        set last_one to i is length of chars
+        set ends to (c is "." or c is "!" or c is "?") and (last_one or item (i + 1) of chars is " " or item (i + 1) of chars is "\n")
+        if ends or last_one
+            add cite_one(sentence, passages) to made
+            set sentence to ""
+        end
+    end
+    return made
+end
+
+# words cut to their first 5 letters
+to stems with words
+    set made to empty list
+    for each w in words
+        if length of w is greater than 5
+            add items 1 to 5 of w to made
+        else
+            add w to made
+        end
+    end
+    return made
+end
+
+to cite_one with sentence, passages
+    if "[" is in sentence
+        return sentence
+    end
+    set words to stems(ct_text's terms(sentence))
+    if length of words is 0
+        return sentence
+    end
+    set best to 0
+    set best_share to 0.4
+    for each r from 1 to length of passages
+        set shared to 0
+        for each w in words
+            if w is in item r of passages
+                add 1 to shared
+            end
+        end
+        if (shared / length of words) is greater than best_share or (best is 0 and (shared / length of words) is best_share)
+            set best to r
+            set best_share to shared / length of words
+        end
+    end
+    if best is 0
+        return sentence
+    end
+    set mark to item (length of sentence) of sentence
+    if mark is "." or mark is "!" or mark is "?"
+        return items 1 to (length of sentence - 1) of sentence + " [" + best + "]" + mark
+    end
+    return sentence + " [" + best + "]"
+end

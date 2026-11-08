@@ -1,0 +1,131 @@
+# A small language model that writes the answer from the passages found, run on this computer: Qwen2.5-0.5B-
+# Instruct as ONNX (onnx-community's export, its int8 weights, 512 MB), through the ONNX Runtime that comes with
+# Windows 11. It reads the passages and the question in Qwen's chat form, then gives a token at a time, keeping
+# what each layer worked out (its keys and values) for the next, until it says it's done.
+#
+#   use "writer.folio" as writer
+#   set w to writer's load("models/Qwen2.5-0.5B-Instruct")      # model_int8.onnx, tokenizer.json, config.json
+#   say writer's generated(w, "Say hello in French.", 40)
+
+use "onnx.folio" as wr_onnx
+use "arrays.folio" as wr_arrays
+use the package "tokenizer" as wr_tokenizer
+
+# a writer from a folder with model_int8.onnx (or model.onnx), tokenizer.json and config.json
+to load with folder
+    set model_file to folder + "/model_int8.onnx"
+    set tok to wr_tokenizer's load_hugging_face(folder + "/tokenizer.json")
+    set config to json from read (folder + "/config.json")
+    set heads to item "num_key_value_heads" of config
+    set per_head to item "hidden_size" of config / item "num_attention_heads" of config
+    set model to wr_onnx's load(model_file)
+    set layers to 0
+    for each wanted in wr_onnx's inputs(model)
+        if wr_starts(wanted's name, "past_key_values.") and wr_ends(wanted's name, ".key")
+            add 1 to layers
+        end
+    end
+    set stop_ids to list of wr_tokenizer's encode(tok, "<|im_end|>"), wr_tokenizer's encode(tok, "<|endoftext|>")
+    return record with kind "writer", model model, tokenizer tok, layers layers, heads heads, per_head per_head,
+        stops list of item 1 of item 1 of stop_ids, item 1 of item 2 of stop_ids
+end
+
+to wr_starts with words, start
+    return length of words is at least length of start and items 1 to (length of start) of words is start
+end
+
+to wr_ends with words, ending
+    return length of words is at least length of ending and items (length of words - length of ending + 1) to (length of words) of words is ending
+end
+
+# what the model writes after the prompt, in Qwen's chat form with a system line, up to most_tokens tokens
+to generated with w, prompt, most_tokens
+    set chat to "<|im_start|>system\nYou answer questions using only the passages you are given. Cite each passage you use as [n].<|im_end|>\n" +
+        "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n"
+    return write_tokens(w, wr_tokenizer's encode(w's tokenizer, chat), most_tokens)
+end
+
+# the model's text after these tokens: the prompt's first token alone, then the rest 64 at a time, each step
+# keeping the layers' keys and values; then the most likely next token, again and again. (With nothing kept yet,
+# Windows' ONNX Runtime 1.17 lets each of several tokens see the ones after it, so the first goes alone.)
+to write_tokens with w, prompt_ids, most_tokens
+    set past to empty dictionary
+    for each layer from 0 to w's layers - 1
+        for each part in list of "key", "value"
+            set item ("past_key_values." + layer + "." + part) of past to wr_arrays's zeros(list of 1, w's heads, 0, w's per_head)
+        end
+    end
+    set seen to 0
+    set logits to nothing
+    set i to 1
+    repeat while i is at most length of prompt_ids
+        set upto to i + 63
+        if i is 1
+            set upto to 1
+        end
+        if upto is greater than length of prompt_ids
+            set upto to length of prompt_ids
+        end
+        set got to wr_step(w, items i to upto of prompt_ids, seen, past)
+        set past to got's past
+        set logits to got's last
+        set seen to upto
+        set i to upto + 1
+    end
+    set made to empty list
+    repeat while length of made is less than most_tokens
+        set next_id to wr_most_likely(logits)
+        if next_id is in w's stops
+            set most_tokens to length of made
+        else
+            add next_id to made
+            set got to wr_step(w, (list of next_id), seen, past)
+            set past to got's past
+            set logits to got's last
+            add 1 to seen
+        end
+    end
+    return wr_tokenizer's decode(w's tokenizer, made)
+end
+
+# one run of the model: these tokens after `seen` already read; the last one's scores, and the keys and values
+to wr_step with w, ids, seen, past
+    set n to length of ids
+    set positions to empty list
+    for each k from 0 to n - 1
+        add seen + k to positions
+    end
+    set mask to empty list
+    for each k from 1 to seen + n
+        add 1 to mask
+    end
+    set inputs to dictionary where "input_ids" is wr_arrays's array(list of ids), "attention_mask" is wr_arrays's array(list of mask),
+        "position_ids" is wr_arrays's array(list of positions)
+    for each name in keys of past
+        set item name of inputs to item name of past
+    end
+    set out to wr_onnx's run(w's model, inputs)
+    set kept to empty dictionary
+    for each name in keys of out
+        if wr_starts(name, "present.")
+            set item ("past_key_values." + (items 9 to (length of name) of name)) of kept to item name of out
+        end
+    end
+    set scores to item "logits" of out
+    set width to item 3 of scores's shape
+    set numbers to scores's data # the array's own list, not a copy: only the last row is taken from it
+    return record with past kept, last items ((n - 1) * width + 1) to (n * width) of numbers
+end
+
+# the place, from 0, of the largest score
+to wr_most_likely with scores
+    set best to 1
+    set top to item 1 of scores
+    for each k from 2 to length of scores
+        if item k of scores is greater than top
+            set top to item k of scores
+            set best to k
+        end
+    end
+    return best - 1
+end

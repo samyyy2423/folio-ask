@@ -1,0 +1,203 @@
+# The text of a web page (.html) and of a Word document (.docx), for a knowledge base: their words and
+# paragraphs, without the markup. A page's scripts and styles are left out, its headings, paragraphs, list items,
+# rows and line breaks each start a line, and &amp; and the rest are made what they stand for. A Word document is
+# a zip of XML: its word/document.xml's runs of text, each paragraph a line.
+#
+#   use "documents.folio" as documents
+#   say documents's text_of_html(read "page.html")
+#   say documents's text_of_docx(read bytes "report.docx")
+
+use "zip.folio" as doc_zip
+
+set doc_block_tags to list of "p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article",
+    "header", "footer", "table", "ul", "ol", "pre", "blockquote", "hr", "td", "th", "dt", "dd"
+
+# a page's text: its words between the tags, a new line where a block starts or ends
+to text_of_html with page
+    set made to ""
+    set chars to split page by ""
+    set n to length of chars
+    set i to 1
+    set skipping to ""
+    repeat while i is at most n
+        set c to item i of chars
+        if c is "<"
+            set j to i + 1
+            repeat while j is at most n and item j of chars is not ">"
+                add 1 to j
+            end
+            set tag to doc_tag_name(chars, i + 1, j - 1)
+            if skipping is not ""
+                if tag is "/" + skipping
+                    set skipping to ""
+                end
+            else if tag is "script" or tag is "style" or tag is "noscript" or tag is "svg"
+                set skipping to tag
+            else
+                set bare to tag
+                if length of bare is greater than 1 and item 1 of bare is "/"
+                    set bare to items 2 to (length of bare) of bare
+                end
+                if bare is in doc_block_tags
+                    add "\n\n" to made
+                else
+                    add " " to made
+                end
+            end
+            set i to j + 1
+        else
+            if skipping is ""
+                add c to made
+            end
+            add 1 to i
+        end
+    end
+    return doc_tidied(doc_entities(made))
+end
+
+# a tag's name, small letters, with its / if it closes one: "p", "/div"
+to doc_tag_name with chars, from, upto
+    set made to ""
+    set k to from
+    repeat while k is at most upto
+        set c to item k of chars
+        if c is " " or c is "\n" or c is "\t" or c is ">" or (c is "/" and made is not "")
+            set k to upto + 1
+        else
+            add c to made
+            add 1 to k
+        end
+    end
+    return lowercase of made
+end
+
+# a Word document's text: each paragraph's runs (w:t), tabs as spaces, line breaks as new lines
+to text_of_docx with data
+    set files to doc_zip's unzipped(data)
+    if not ("word/document.xml" is in files)
+        fail with "this isn't a Word document: it has no word/document.xml"
+    end
+    set xml to item "word/document.xml" of files as text
+    set made to ""
+    set chars to split xml by ""
+    set n to length of chars
+    set i to 1
+    repeat while i is at most n
+        if item i of chars is "<"
+            set j to i + 1
+            repeat while j is at most n and item j of chars is not ">"
+                add 1 to j
+            end
+            set tag to doc_tag_name(chars, i + 1, j - 1)
+            if tag is "w:t" and item (j - 1) of chars is not "/"
+                set k to j + 1
+                repeat while k is at most n and item k of chars is not "<"
+                    add item k of chars to made
+                    add 1 to k
+                end
+                set j to k - 1
+            else if tag is "/w:p"
+                add "\n\n" to made
+            else if tag is "w:tab"
+                add " " to made
+            else if tag is "w:br"
+                add "\n" to made
+            end
+            set i to j + 1
+        else
+            add 1 to i
+        end
+    end
+    return doc_tidied(doc_entities(made))
+end
+
+# &amp;, &lt;, &gt;, &quot;, &#39; or &apos;, &nbsp; and &#number; made what they stand for
+to doc_entities with words
+    set made to ""
+    set chars to split words by ""
+    set n to length of chars
+    set i to 1
+    repeat while i is at most n
+        set c to item i of chars
+        if c is "&"
+            set j to i + 1
+            repeat while j is at most n and j - i is less than 10 and item j of chars is not ";" and item j of chars is not "&"
+                add 1 to j
+            end
+            if j is at most n and item j of chars is ";"
+                set name to ""
+                for each k from i + 1 to j - 1
+                    add item k of chars to name
+                end
+                set meant to doc_entity(name)
+                if meant is nothing
+                    add c to made
+                    add 1 to i
+                else
+                    add meant to made
+                    set i to j + 1
+                end
+            else
+                add c to made
+                add 1 to i
+            end
+        else
+            add c to made
+            add 1 to i
+        end
+    end
+    return made
+end
+
+to doc_entity with name
+    set known to dictionary where "amp" is "&", "lt" is "<", "gt" is ">", "quot" is "\"", "apos" is "'", "nbsp" is " ",
+        "#39" is "'", "mdash" is "—", "ndash" is "–", "hellip" is "…", "rsquo" is "’", "lsquo" is "‘", "ldquo" is "“", "rdquo" is "”"
+    if name is in known
+        return item name of known
+    end
+    if length of name is greater than 1 and item 1 of name is "#"
+        try
+            set code to number of (items 2 to (length of name) of name)
+            if code is at least 32 and code is less than 128
+                return (list of code) as bytes as text
+            end
+        if it fails
+            return nothing
+        end
+    end
+    return nothing
+end
+
+# runs of spaces made one, each line trimmed, and no more than one empty line in a row
+to doc_tidied with words
+    set lines to empty list
+    set blank to yes
+    for each line in split words by "\n"
+        set kept to ""
+        set spaced to no
+        for each c in line
+            if c is " " or c is "\t"
+                set spaced to kept is not ""
+            else
+                if spaced
+                    add " " to kept
+                    set spaced to no
+                end
+                add c to kept
+            end
+        end
+        if kept is ""
+            if not blank
+                add "" to lines
+                set blank to yes
+            end
+        else
+            add kept to lines
+            set blank to no
+        end
+    end
+    if length of lines is greater than 0 and item (length of lines) of lines is ""
+        set lines to items 1 to (length of lines - 1) of lines
+    end
+    return join lines with "\n"
+end

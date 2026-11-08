@@ -1,0 +1,6 @@
+# The packages this program uses: each one's name, where it comes from, and the commit it's at.
+# folio get fetches them into packages/, and folio add, update and remove change this list.
+rag https://github.com/samyyy2423/folio-rag 417eb66ae4c98e994c16a60f034742b5a07914dd
+vectors https://github.com/samyyy2423/folio-vectors c1369306dfdaa0307216ce0b3ca3471afbb858b0
+tokenizer https://github.com/samyyy2423/folio-tokenizer c75b22c37c44e3d7629725aa5359a4dd78d1efd6
+pdftext https://github.com/samyyy2423/folio-pdftext c11fe0862e57be8d559f4c902236743e1053a6bb

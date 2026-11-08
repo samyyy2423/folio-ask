@@ -1,0 +1,226 @@
+# How well the search finds the passage that answers a question: questions in other words than the documents',
+# each with a few words the right passage has in it, asked of a knowledge base five ways, and how often the right
+# passage comes first, in the first 3, 5 and 20, and the mean of 1 / its place in the first 10 (MRR).
+#
+#     folio run --allow-read --allow-libraries evaluate.folio eval/folio-docs.json --kb folio.rag
+#
+# A questions file is JSON: {"questions": [{"question": "...", "evidence": ["words the passage has", ...]}]}.
+# A passage counts as right when it has any of the evidence, with case, spaces, ` and * not counted. --misses
+# lists the questions the reranked search didn't find first.
+
+use the package "rag" as rag
+use "rerank.folio" as rerank
+use "system.folio" as system
+use "knowledge.folio" as knowledge
+
+set kb_file to "docs.rag"
+set reranker_folder to "models/ms-marco-MiniLM-L-6-v2"
+set questions_file to ""
+set show_misses to no
+set show_text to no
+set show_pool to no
+set k to 1
+repeat while k is at most length of arguments
+    set arg to item k of arguments
+    if arg is "--kb" and k is less than length of arguments
+        set kb_file to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--reranker" and k is less than length of arguments
+        set reranker_folder to item (k + 1) of arguments
+        set k to k + 1
+    else if arg is "--text"
+        set show_text to yes
+        set show_misses to yes
+    else if arg is "--pool"
+        set show_pool to yes
+    else if arg is "--misses"
+        set show_misses to yes
+    else
+        set questions_file to arg
+    end
+    set k to k + 1
+end
+if questions_file is ""
+    fail with "evaluate.folio needs a questions file: evaluate.folio eval/folio-docs.json --kb folio.rag"
+end
+
+# a file's name without its folders
+to short_name with path
+    set from to 1
+    for each i from 1 to length of path
+        if item i of path is "/" or item i of path is "\\"
+            set from to i + 1
+        end
+    end
+    return items from to (length of path) of path
+end
+
+# small letters, ` and * left out, and every run of spaces and new lines one space
+to normal with words
+    set made to ""
+    set spaced to no
+    for each c in lowercase of words
+        if c is " " or c is "\n" or c is "\t"
+            set spaced to made is not ""
+        else if c is not "`" and c is not "*"
+            if spaced
+                add " " to made
+                set spaced to no
+            end
+            add c to made
+        end
+    end
+    return made
+end
+
+set normals to empty dictionary # a chunk's id: its normal text, made once
+
+# whether a chunk has any of the evidence
+to is_right with found, evidence
+    if not (found's id is in normals)
+        set item found's id of normals to normal(found's text)
+    end
+    set have to item found's id of normals
+    for each e in evidence
+        if e is in have
+            return yes
+        end
+    end
+    return no
+end
+
+# the place of the first right chunk, from 1, or 0
+to place_of with found, evidence
+    for each r from 1 to length of found
+        if is_right(item r of found, evidence)
+            return r
+        end
+    end
+    return 0
+end
+
+set reranker to nothing
+if system's is_file(reranker_folder + "/model.onnx")
+    set reranker to rerank's load(reranker_folder)
+end
+set rerank_scores to empty dictionary # a chunk's id: its score for the question being asked
+
+# chunks put in order by the reranker, scores kept for the question so a chunk is read once
+to reranked with question, found
+    set wanted to empty list
+    for each f in found
+        if not (f's id is in rerank_scores)
+            add f to wanted
+        end
+    end
+    if length of wanted is greater than 0
+        set got to rerank's scores(reranker, question, list of f's text for each f in wanted)
+        for each i from 1 to length of wanted
+            set item (item i of wanted)'s id of rerank_scores to item i of got
+        end
+    end
+    set scored to list of record with found f, score item f's id of rerank_scores for each f in found
+    return list of s's found for each s in scored in reverse order by score
+end
+
+set kb to knowledge's opened(kb_file)
+set asked to json from read questions_file
+set questions to item "questions" of asked
+set ways to list of "BM25 (words)", "MiniLM (meaning)", "BM25 and MiniLM, fused"
+if reranker is not nothing
+    add "BM25, then reranked" to ways
+    add "fused, then reranked" to ways
+end
+set places to empty dictionary
+for each way in ways
+    set item way of places to empty list
+end
+set misses to empty list
+set t to the clock
+set rerank_time to 0
+for each q in questions
+    set question to item "question" of q
+    set evidence to list of normal(e) for each e in item "evidence" of q
+    set by_words to rag's search_by(kb, question, 20, "words")
+    set by_meaning to rag's search_by(kb, question, 20, "meaning")
+    set fused to rag's search(kb, question, 20)
+    if show_pool
+        set shown to empty list
+        for each list_found in list of by_words, by_meaning, fused
+            set top to item 1 of list_found
+            if not is_right(top, evidence) and not (top's id is in shown)
+                add top's id to shown
+                say "POOL " question " | " short_name(top's source) " | " normal(top's text)
+            end
+        end
+    end
+    add place_of(by_words, evidence) to item "BM25 (words)" of places
+    add place_of(by_meaning, evidence) to item "MiniLM (meaning)" of places
+    add place_of(fused, evidence) to item "BM25 and MiniLM, fused" of places
+    if reranker is not nothing
+        set rerank_scores to empty dictionary
+        set started to the clock
+        set words_best to reranked(question, by_words)
+        add place_of(words_best, evidence) to item "BM25, then reranked" of places
+        set best to reranked(question, fused)
+        if show_pool
+            for each top in list of item 1 of words_best, item 1 of best
+                if not is_right(top, evidence)
+                    say "POOL-R " question " | " short_name(top's source) " | " normal(top's text)
+                end
+            end
+        end
+        set rerank_time to rerank_time + (the clock - started)
+        set p to place_of(best, evidence)
+        add p to item "fused, then reranked" of places
+        if p is not 1
+            add record with question question, place p, first (item 1 of best)'s source, text (item 1 of best)'s text to misses
+        end
+    end
+end
+
+# the share of places at most n, as a percentage
+to share_within with ps, n
+    set count to 0
+    for each p in ps
+        if p is greater than 0 and p is at most n
+            add 1 to count
+        end
+    end
+    return (100 * count / length of ps) with 1 decimals
+end
+
+to mrr with ps
+    set total to 0
+    for each p in ps
+        if p is greater than 0 and p is at most 10
+            set total to total + 1 / p
+        end
+    end
+    return (total / length of ps) with 3 decimals
+end
+
+say length of questions " questions, " rag's size(kb) " chunks, in " ((the clock - t) rounded) " s"
+if reranker is not nothing
+    say "the reranker took " ((1000 * rerank_time / length of questions) rounded) " ms a question"
+end
+say ""
+say "| | first | first 3 | first 5 | first 20 | MRR@10 |"
+say "|:--|--:|--:|--:|--:|--:|"
+for each way in ways
+    set ps to item way of places
+    say "| " way " | " share_within(ps, 1) "% | " share_within(ps, 3) "% | " share_within(ps, 5) "% | " share_within(ps, 20) "% | " mrr(ps) " |"
+end
+if show_misses
+    say ""
+    for each m in misses
+        if m's place is 0
+            say "not in the first 20: " m's question
+        else
+            say "found " m's place ", " short_name(m's first) " first: " m's question
+        end
+        if show_text
+            say "    " normal(m's text)
+        end
+    end
+end

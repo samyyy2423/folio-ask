@@ -1,0 +1,10 @@
+# fetched by folio get
+packages/
+# fetched by ask.folio models
+models/
+# made by index, and by train.folio
+*.rag
+*.rag.json
+trained/
+# what folio run leaves while a program runs
+*-run.exe

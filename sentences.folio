@@ -1,0 +1,113 @@
+# A text's words and sentences, as ask.folio and train.folio match them: terms (lower case words, less the
+# common ones) and sentences_of (a chunk's sentences, from its paragraphs)
+
+set common to list of "a", "an", "the", "is", "are", "was", "were", "be", "to", "of", "in", "on", "for", "and",
+    "or", "it", "its", "do", "does", "did", "how", "what", "which", "who", "why", "when", "where", "can", "i", "you",
+    "my", "your", "with", "that", "this", "as", "by", "at", "from", "if", "about", "there", "so", "not", "me"
+
+# a text's words for matching: lower case, each run of letters or numbers, less the common ones
+to terms with words
+    set made to empty list
+    set current to ""
+    for each c in lowercase of words + " "
+        if (c is at least "a" and c is at most "z") or (c is at least "0" and c is at most "9")
+            add c to current
+        else
+            if current is not "" and not (current is in common)
+                add current to made
+            end
+            set current to ""
+        end
+    end
+    return made
+end
+
+# a chunk's sentences, each on its own: its lines joined into paragraphs (a blank line, a list item or a table's
+# row ends one), headings, tables and code left out, Markdown's ** taken away, and the chunk's first sentence too
+# if it starts in the middle of one, as a chunk can after the end of the one before it
+to sentences_of with words
+    set made to empty list
+    set paragraph to ""
+    set in_code to no
+    for each line in split words by "\n"
+        set t to trimmed(line)
+        if starts(t, "```")
+            set in_code to not in_code
+            take_paragraph(made, paragraph)
+            set paragraph to ""
+        else if in_code
+            set in_code to in_code
+        else if t is "" or starts(t, "#") or starts(t, "|")
+            take_paragraph(made, paragraph)
+            set paragraph to ""
+        else if starts(t, "- ") or starts(t, "* ") or starts(t, "> ")
+            take_paragraph(made, paragraph)
+            set paragraph to items 3 to (length of t) of t
+        else if paragraph is ""
+            set paragraph to t
+        else
+            set paragraph to paragraph + " " + t
+        end
+    end
+    take_paragraph(made, paragraph)
+    if length of made is greater than 0 and not starts_well(item 1 of made)
+        if length of made is 1
+            return empty list
+        end
+        return items 2 to (length of made) of made
+    end
+    return made
+end
+
+# a paragraph's sentences, each ending at a . ? or ! with a space or the end after it
+to take_paragraph with made, words
+    set text to join (split words by "**") with ""
+    set current to ""
+    set chars to split text by ""
+    set n to length of chars
+    for each i from 1 to n
+        set c to item i of chars
+        add c to current
+        if (c is "." or c is "?" or c is "!") and (i is n or item (i + 1) of chars is " ")
+            take_sentence(made, current)
+            set current to ""
+        end
+    end
+    take_sentence(made, current)
+end
+
+to take_sentence with made, words
+    set s to trimmed(words)
+    repeat while starts(s, "- ") or starts(s, "* ")
+        set s to trimmed(items 3 to (length of s) of s)
+    end
+    if length of s is at least 25 and length of terms(s) is at least 3
+        add s to made
+    end
+end
+
+# whether a sentence starts as one does: a capital letter, a digit, or code
+to starts_well with s
+    set c to item 1 of s
+    return (c is at least "A" and c is at most "Z") or (c is at least "0" and c is at most "9") or c is "`" or c is "\""
+end
+
+to starts with words, start
+    return length of words is at least length of start and items 1 to (length of start) of words is start
+end
+
+# without the spaces and tabs at either end
+to trimmed with words
+    set from to 1
+    set upto to length of words
+    repeat while from is at most upto and (item from of words is " " or item from of words is "\t")
+        add 1 to from
+    end
+    repeat while upto is at least from and (item upto of words is " " or item upto of words is "\t" or (item upto of words) as bytes is (list of 13) as bytes)
+        set upto to upto - 1
+    end
+    if upto is less than from
+        return ""
+    end
+    return items from to upto of words
+end
