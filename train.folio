@@ -287,10 +287,6 @@ end
 
 # ---------- what each way finds ----------
 
-to places_of with found
-    return list of item f's id of slot_of for each f in found
-end
-
 to rank_in with places, wanted
     for each r from 1 to length of places
         if item r of places is wanted
